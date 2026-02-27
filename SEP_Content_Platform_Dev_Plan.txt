@@ -1,0 +1,470 @@
+SEO Content Generation Platform
+Backend Engineer Assessment — Development Plan
+Version 1.0  |  Prepared: February 2026
+
+1. Executive Summary
+This document outlines the complete development plan for building an intelligent, agent-based SEO content generation service. The system ingests a topic, analyzes real SERP data, synthesizes a keyword-aware article outline, and produces a publish-ready article with proper heading hierarchy, SEO metadata, internal/external link suggestions, and a quality validation score.
+The implementation prioritizes a clean layered architecture, durable job management, and a structured agent pipeline that is both testable and extensible. Bonus features (content scoring, FAQ generation, durability on crash) are included in the phased roadmap.
+
+Estimated effort: 4–6 hours (senior engineer)
+Core deliverable: Working FastAPI service + agent pipeline + test suite
+Language: Python 3.11+  |  Framework: FastAPI  |  LLM: Anthropic Claude via SDK
+Database: SQLite (dev) / PostgreSQL (prod)  |  ORM: SQLAlchemy + Alembic
+
+2. System Architecture
+2.1 High-Level Overview
+The system follows a layered, pipeline-oriented architecture. A FastAPI HTTP layer handles request intake and job status queries. An async job dispatcher persists job state and hands work off to an agent runner. The agent runner executes a deterministic multi-step pipeline, persisting intermediate results so any step can be resumed after a crash.
+
+Layer
+Responsibility
+Key Technologies
+API Layer
+REST endpoints for job submission & status
+FastAPI, Pydantic v2
+Job Manager
+Persist, dispatch, and track generation jobs
+SQLAlchemy, Celery or asyncio
+Agent Pipeline
+Multi-step SERP → outline → draft → validate
+LangChain / raw LLM calls
+SERP Adapter
+Fetch or mock search result data
+SerpAPI / ValueSERP / mock
+LLM Client
+Generate outlines, content, metadata
+Anthropic SDK / OpenAI SDK
+Quality Scorer
+Validate SEO constraints, trigger revisions
+Custom + regex heuristics
+Persistence Layer
+Store jobs, intermediate steps, outputs
+SQLite / PostgreSQL
+
+2.2 Agent Pipeline Steps
+The agent pipeline is broken into discrete, idempotent steps. Each step writes its output to the database before proceeding. On restart, the runner inspects which steps are already complete and skips them — providing crash durability at the step level.
+
+	•	SERP Fetch: Retrieve top-10 search results for the primary keyword. Cache raw JSON to DB.
+	•	Theme Extraction: Parse titles and snippets; cluster common subtopics and secondary keywords using LLM.
+	•	Outline Generation: Produce a structured H1/H2/H3 outline targeting the same search intent as top results.
+	•	Article Drafting: Generate full article section-by-section, enforcing word count budget per section.
+	•	Metadata Generation: Derive SEO title tag (50–60 chars) and meta description (150–160 chars).
+	•	Link Strategy: Identify 3–5 internal anchor texts and 2–4 external authoritative citations.
+	•	FAQ Section: (Bonus) Extract People Also Ask questions from SERP; generate answers.
+	•	Quality Scoring: (Bonus) Run SEO constraint checklist; flag failures; optionally re-prompt for revision.
+
+2.3 Data Flow Diagram
+POST /jobs  →  JobRecord (status=pending)
+  ↓  Dispatcher picks up job
+  ↓  Step 1: SerpAdapter.fetch() → SerpResult[] → DB
+  ↓  Step 2: AgentRunner.extract_themes() → ThemeReport → DB
+  ↓  Step 3: AgentRunner.generate_outline() → Outline → DB
+  ↓  Step 4: AgentRunner.draft_article() → ArticleDraft → DB
+  ↓  Step 5: AgentRunner.generate_metadata() → SEOMetadata → DB
+  ↓  Step 6: AgentRunner.build_link_strategy() → LinkStrategy → DB
+  ↓  Step 7 (bonus): AgentRunner.generate_faq() → FAQSection → DB
+  ↓  Step 8 (bonus): QualityScorer.score() → QualityReport → DB
+  ↓  Assemble ArticleOutput → status=completed
+GET /jobs/{id}  →  Full ArticleOutput JSON
+
+3. Data Models (Pydantic + SQLAlchemy)
+3.1 API Input / Output Schemas
+# Input
+class GenerationRequest(BaseModel):
+    topic: str                          # Primary keyword / topic
+    target_word_count: int = 1500       # Article length target
+    language: str = 'en'               # BCP-47 language tag
+
+# Core output types
+class SerpResult(BaseModel):
+    rank: int; url: str; title: str; snippet: str
+
+class ArticleSection(BaseModel):
+    heading_level: Literal['H1','H2','H3']
+    heading_text: str; content: str; word_count: int
+
+class SEOMetadata(BaseModel):
+    title_tag: str        # 50-60 chars
+    meta_description: str # 150-160 chars
+    primary_keyword: str
+    secondary_keywords: list[str]
+
+class InternalLink(BaseModel):
+    anchor_text: str; suggested_target_topic: str; placement_section: str
+
+class ExternalReference(BaseModel):
+    url: str; publisher: str; context_for_citation: str; placement_section: str
+
+class ArticleOutput(BaseModel):
+    job_id: str; topic: str; sections: list[ArticleSection]
+    seo_metadata: SEOMetadata; internal_links: list[InternalLink]
+    external_references: list[ExternalReference]
+    faq: list[FAQItem] | None; quality_score: QualityReport | None
+    total_word_count: int; created_at: datetime
+
+3.2 Database Schema
+Table
+Key Columns
+Purpose
+generation_jobs
+id (UUID), status, topic, config_json, created_at, updated_at
+Job lifecycle tracking
+pipeline_steps
+id, job_id, step_name, status, result_json, error, started_at, completed_at
+Per-step durability
+article_outputs
+id, job_id, output_json, quality_score, word_count, created_at
+Final assembled output
+
+The pipeline_steps table is the key to crash durability. Each step writes status='running' on start, then 'completed' with its JSON result on success. On runner restart, it queries for the highest completed step and resumes from the next one.
+
+4. Repository Structure
+seo-content-agent/
+├── app/
+│   ├── main.py                  # FastAPI app, router registration
+│   ├── api/
+│   │   ├── routes.py            # POST /jobs, GET /jobs/{id}
+│   │   └── schemas.py           # Pydantic API schemas
+│   ├── agent/
+│   │   ├── pipeline.py          # AgentRunner: orchestrates steps
+│   │   ├── serp_adapter.py      # SerpAPI / mock SERP fetcher
+│   │   ├── theme_extractor.py   # LLM-based theme clustering
+│   │   ├── outline_generator.py # Outline builder
+│   │   ├── article_drafter.py   # Section-by-section drafter
+│   │   ├── metadata_builder.py  # Title tag & meta desc
+│   │   ├── link_strategist.py   # Internal & external links
+│   │   ├── faq_generator.py     # (Bonus) FAQ from SERP
+│   │   └── quality_scorer.py    # (Bonus) SEO constraint checker
+│   ├── db/
+│   │   ├── models.py            # SQLAlchemy ORM models
+│   │   ├── session.py           # DB session factory
+│   │   └── crud.py              # CRUD helpers
+│   ├── jobs/
+│   │   └── dispatcher.py        # Async job queue / Celery worker
+│   └── config.py               # Settings via pydantic-settings
+├── tests/
+│   ├── test_api.py             # Endpoint integration tests
+│   ├── test_pipeline.py        # Agent step unit tests
+│   ├── test_quality_scorer.py  # SEO constraint validation tests
+│   └── fixtures/               # Mock SERP data, expected outputs
+├── alembic/                    # DB migrations
+├── examples/
+│   └── productivity_tools/     # Full input → output example
+├── .env.example
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+└── README.md
+
+5. Phased Implementation Plan
+Phase 1 — Foundation (60–75 min)
+	•	Initialize FastAPI project, configure Pydantic settings (API keys, DB URL, LLM model)
+	•	Define all Pydantic schemas: GenerationRequest, SerpResult, ArticleOutput, and sub-models
+	•	Set up SQLAlchemy models for generation_jobs, pipeline_steps, article_outputs
+	•	Configure Alembic and run initial migration
+	•	Implement basic CRUD helpers (create_job, update_step_status, get_job, etc.)
+	•	Scaffold the SERP adapter with a realistic mock dataset (10 results with rank, url, title, snippet)
+	•	Write POST /jobs and GET /jobs/{id} endpoints with proper status codes
+
+Phase 2 — Core Agent Pipeline (90–100 min)
+	•	Implement AgentRunner.run() with step-by-step execution and resume logic
+	•	Step 1 — SERP Fetch: call adapter, persist raw results to pipeline_steps
+	•	Step 2 — Theme Extraction: LLM prompt to cluster subtopics and extract secondary keywords from snippets
+	•	Step 3 — Outline Generation: LLM prompt producing a validated H1/H2/H3 hierarchy
+	•	Step 4 — Article Drafting: section-by-section generation with word count budget enforcement
+	•	Step 5 — Metadata: title tag (50–60 chars), meta description (150–160 chars), keyword list
+	•	Step 6 — Link Strategy: 3–5 internal anchors with target pages, 2–4 external citations with placement context
+	•	Assemble final ArticleOutput and write to article_outputs table; set job status=completed
+	•	Wire up async job dispatch from POST /jobs endpoint
+
+Phase 3 — Quality & Durability (45–60 min)
+	•	Implement QualityScorer with checks: keyword in title/intro, header hierarchy, word count, meta length
+	•	Add quality_score to ArticleOutput; if score < threshold, re-prompt the drafter with feedback
+	•	Verify crash durability by testing resume from each pipeline step
+	•	Add graceful error handling: SERP API timeout → fallback to mock; LLM rate limit → exponential backoff
+	•	(Bonus) FAQ generator: parse People Also Ask data from SERP, generate concise Q&A pairs
+
+Phase 4 — Testing & Documentation (45–60 min)
+	•	Unit tests for each agent step (mocked LLM + SERP responses)
+	•	Integration test: full job lifecycle from POST to completed ArticleOutput
+	•	SEO constraint tests: assert keyword presence, heading counts, meta char limits
+	•	Write README with setup instructions, env vars, and a worked example
+	•	Create examples/productivity_tools/ with sample JSON input and full output
+
+Phase
+Focus
+Time
+Deliverable
+1
+Foundation
+60–75 min
+Working API + DB + SERP mock
+2
+Agent Pipeline
+90–100 min
+End-to-end article generation
+3
+Quality & Durability
+45–60 min
+Scorer, resume logic, error handling
+4
+Tests & Docs
+45–60 min
+Test suite + README + example
+
+6. Agent Prompt Strategy
+6.1 Theme Extraction Prompt
+System: You are an SEO strategist. Analyze search result data and extract content themes.
+
+User: Given these top-10 SERP results for '{topic}':
+  {serp_json}
+
+Return JSON with:
+  - primary_keyword: string
+  - secondary_keywords: string[] (8-12 related terms)
+  - main_subtopics: string[] (5-8 recurring themes across results)
+  - search_intent: 'informational' | 'commercial' | 'transactional' | 'navigational'
+  - content_gaps: string[] (topics NOT covered that could differentiate our article)
+
+6.2 Outline Generation Prompt
+System: You are a senior content strategist specializing in SEO-optimized article structure.
+
+User: Create a detailed article outline for '{topic}' that:
+  - Targets these subtopics: {subtopics}
+  - Uses primary keyword '{primary_keyword}' in H1 naturally
+  - Includes H2s for each major subtopic and H3s for sub-points
+  - Targets {word_count} total words
+  - Matches search intent: {intent}
+
+Return structured JSON: { h1: string, sections: [{h2, word_budget, h3s: [string]}] }
+
+6.3 Article Drafting Prompt (per section)
+System: You are an expert content writer. Write naturally — never robotic or formulaic.
+        Incorporate keywords contextually, not repeatedly. Vary sentence structure.
+
+User: Write the '{heading}' section of an article about '{topic}'.
+  Target: {word_budget} words.
+  Primary keyword: {primary_keyword}
+  Secondary keywords to weave in naturally: {secondary_keywords}
+  Tone: informative, engaging, expert — like a knowledgeable colleague explaining clearly.
+  Do NOT use filler phrases ('In today's world...', 'It goes without saying...')
+  Return only the section text (no heading).
+
+7. SEO Quality Scorer
+7.1 Constraint Checklist
+The QualityScorer runs after the draft is complete and returns a structured report. If the overall score is below 70/100, the pipeline re-prompts the drafter with specific feedback.
+
+Constraint
+Check Logic
+Points
+Primary keyword in H1
+Case-insensitive substring match
+15
+Primary keyword in first 100 words
+Search intro paragraph
+10
+Meta title length (50–60 chars)
+len() check
+10
+Meta description length (150–160 chars)
+len() check
+10
+Heading hierarchy valid
+H1 appears once; H2/H3 properly nested
+15
+Word count within 10% of target
+abs(actual - target) / target <= 0.10
+10
+Secondary keyword coverage (>=60%)
+Count present / total secondary keywords
+15
+Internal links present (3–5)
+Count InternalLink items
+10
+External references present (2–4)
+Count ExternalReference items
+5
+
+8. Error Handling Strategy
+8.1 SERP API Failures
+	•	Wrap SERP calls in try/except with 3 retries (exponential backoff: 1s, 2s, 4s)
+	•	On persistent failure, fall back to a realistic mock dataset and flag job with warning
+	•	Log raw error to pipeline_steps.error column for observability
+
+8.2 LLM API Failures
+	•	Catch rate limit errors (429) — backoff and retry up to 5 times
+	•	On timeout or 5xx, retry 2 times then mark step as failed; job remains resumable
+	•	Validate LLM JSON output against Pydantic model; if parse fails, re-prompt with error context
+
+8.3 Job Durability
+	•	Each pipeline step sets status='running' on start and 'completed' on success
+	•	On runner restart, query: SELECT * FROM pipeline_steps WHERE job_id = ? ORDER BY step_order
+	•	Resume from the first step not in status='completed'
+	•	A step in status='running' on startup is treated as interrupted and re-runs
+
+9. Testing Strategy
+9.1 Test Categories
+Test Type
+File
+What It Validates
+Unit — SERP adapter
+test_pipeline.py
+Mock response parsing, field mapping
+Unit — Theme extractor
+test_pipeline.py
+LLM output → ThemeReport schema validation
+Unit — Outline generator
+test_pipeline.py
+H1/H2/H3 hierarchy correctness
+Unit — Quality scorer
+test_quality_scorer.py
+Each SEO constraint check individually
+Integration — Full pipeline
+test_pipeline.py
+POST job → poll until completed → assert output
+Integration — Resume
+test_pipeline.py
+Simulate crash at step 3, restart, assert completion
+API — Endpoints
+test_api.py
+Status codes, schema validation, error responses
+
+9.2 Key SEO Assertion Examples
+def test_keyword_in_h1(article_output):
+    h1 = next(s for s in article_output.sections if s.heading_level == 'H1')
+    assert article_output.seo_metadata.primary_keyword.lower() in h1.heading_text.lower()
+
+def test_meta_title_length(article_output):
+    assert 50 <= len(article_output.seo_metadata.title_tag) <= 60
+
+def test_meta_description_length(article_output):
+    assert 150 <= len(article_output.seo_metadata.meta_description) <= 160
+
+def test_internal_link_count(article_output):
+    assert 3 <= len(article_output.internal_links) <= 5
+
+def test_heading_hierarchy(article_output):
+    h1_count = sum(1 for s in article_output.sections if s.heading_level == 'H1')
+    assert h1_count == 1
+
+10. Technology Stack & Dependencies
+Package
+Version
+Purpose
+fastapi
+>=0.111
+HTTP framework
+uvicorn
+>=0.29
+ASGI server
+pydantic
+v2
+Schema validation & settings
+pydantic-settings
+>=2.2
+Env-var config management
+sqlalchemy
+>=2.0
+Async ORM
+alembic
+>=1.13
+DB migrations
+aiosqlite
+>=0.20
+Async SQLite driver (dev)
+asyncpg
+>=0.29
+Async PostgreSQL driver (prod)
+anthropic
+>=0.26
+Claude LLM SDK (or openai)
+httpx
+>=0.27
+Async HTTP for SERP API calls
+pytest
+>=8.0
+Test runner
+pytest-asyncio
+>=0.23
+Async test support
+pytest-httpx
+>=0.30
+Mock HTTP in tests
+
+11. Key Design Decisions
+11.1 Step-Level Durability Over Job-Level
+Rather than treating the entire pipeline as atomic, each step commits its result independently. This means a 4-minute job that fails at step 6 restarts at step 6, not step 1. This is critical when SERP API calls have per-request costs.
+11.2 Pydantic v2 Throughout
+Using Pydantic v2 for all schemas (API, internal agent data, DB serialization) ensures a single source of truth for data shapes. LLM JSON outputs are parsed directly into Pydantic models — a parse failure is caught immediately and triggers a re-prompt, not a runtime error downstream.
+11.3 Section-by-Section Article Drafting
+Rather than asking the LLM to produce a 1,500-word article in one call, each H2 section is drafted independently with a word budget. This produces more consistent quality, avoids context window issues, and allows section-level revision without regenerating the entire article.
+11.4 Mock-First SERP Adapter
+The SerpAdapter is designed as an interface with two implementations: a real HTTP client and a mock that returns realistic fixture data. This allows the pipeline to be fully developed and tested without consuming SERP API credits, and makes the test suite deterministic.
+11.5 Quality Score Threshold with Revision Loop
+If the quality score falls below 70/100, the pipeline passes the specific failing constraints back to the LLM drafter as corrective instructions. A maximum of 2 revision passes is attempted before accepting the best available result, preventing infinite loops.
+
+12. Bonus Features (Time Permitting)
+Feature
+Estimated Time
+Implementation Notes
+FAQ Section Generator
+30 min
+Parse PAA from SERP; LLM generates concise answers in FAQ schema
+Content Quality Scorer
+45 min
+Rule-based checks + LLM readability score; revision loop with max 2 retries
+Job Dashboard (GET /jobs)
+20 min
+Paginated list of all jobs with status filter
+Webhook on completion
+25 min
+POST callback URL in request; fire on job completion
+Docker Compose setup
+20 min
+postgres + redis + worker + api services
+
+13. Example: Input → Output
+13.1 Sample Input
+{
+  "topic": "best productivity tools for remote teams",
+  "target_word_count": 1500,
+  "language": "en"
+}
+
+13.2 Expected Output (abbreviated)
+{
+  "job_id": "a1b2c3d4",
+  "seo_metadata": {
+    "title_tag": "Best Productivity Tools for Remote Teams in 2025",
+    "meta_description": "Discover the top productivity tools for remote teams...",
+    "primary_keyword": "productivity tools for remote teams",
+    "secondary_keywords": ["remote collaboration tools", "team communication software", ...]
+  },
+  "sections": [
+    { "heading_level": "H1", "heading_text": "Best Productivity Tools for Remote Teams", ... },
+    { "heading_level": "H2", "heading_text": "Project Management Tools", ... },
+    ...
+  ],
+  "internal_links": [
+    { "anchor_text": "SEO keyword research tools", "suggested_target_topic": "/seo-tools", ... }
+  ],
+  "external_references": [
+    { "url": "https://hbr.org/...", "context_for_citation": "Cite after remote work stats claim" }
+  ],
+  "quality_score": { "total": 88, "passed_checks": 8, "failed_checks": 1, "details": {...} },
+  "total_word_count": 1487
+}
+
+14. Submission Checklist
+	•	GitHub repo with clean commit history showing incremental progress
+	•	README.md: prerequisites, env setup, how to run, how to run tests
+	•	examples/ directory with worked productivity_tools input → output
+	•	All Pydantic models documented with field descriptions
+	•	Test suite passes: pytest -v with no skips on core pipeline tests
+	•	At least one integration test covering the full job lifecycle
+	•	Error handling documented in README (SERP fallback, LLM retry policy)
+	•	design_decisions.md (or section in README) explaining architecture choices
+	•	.env.example listing all required environment variables
+	•	Dockerfile or docker-compose for one-command startup (optional but recommended)
+
+
+SEO Content Generation Platform — Development Plan  |  Confidential
